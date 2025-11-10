@@ -1,71 +1,56 @@
-// server.js – MCP Reddit (erzwingt HTTP/SSE; kein STDIO-Fallback)
+// server.js — Reddit MCP + Render-Gateway mit /healthz und optional x-api-key
 
-// --- MCP-SDK ---------------------------------------------------------------
+// ---------- MCP SDK ----------
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-
-// Die beiden HTTP-Varianten (in deiner SDK gibt’s mind. eine davon):
 import * as StreamableMod from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as SseMod from "@modelcontextprotocol/sdk/server/sse.js";
+import http from "node:http";
 
-// Hilfsfunktion: wähle Export anhand bekannter Kandidaten oder erster brauchbarer Klasse
+// Transport dynamisch finden (verschiedene SDK-Exporte möglich)
 function pickHttpTransport() {
-  const prefer = [
-    // Streamable HTTP (neuere Builds)
+  const candidates = [
     ["streamableHttp", StreamableMod, [
       "StreamableHttpServerTransport",
       "StreamableHttpTransport",
       "HttpServerTransport",
-      "default"
+      "default",
     ]],
-    // SSE (oft vorhanden – deine SDK hat sse.js)
     ["sse", SseMod, [
       "SseServerTransport",
       "SSEServerTransport",
       "HttpServerTransport",
       "SseTransport",
-      "default"
+      "default",
     ]],
   ];
-
-  for (const [kind, mod, names] of prefer) {
-    if (!mod || Object.keys(mod).length === 0) continue;
-
-    // 1) Versuche Kandidatennamen
+  for (const [kind, mod, names] of candidates) {
+    if (!mod) continue;
     for (const n of names) {
       const ctor = mod?.[n];
       if (typeof ctor === "function") return { ctor, kind };
     }
-    // 2) Fallback: nimm den ersten Funktions-/Klasse-Export
     for (const k of Object.keys(mod)) {
       const v = mod[k];
       if (typeof v === "function") return { ctor: v, kind };
     }
   }
-
-  console.error("❌ Kein HTTP/SSE-Transport gefunden.");
-  console.error("   Verfügbare Exporte streamableHttp.js:", Object.keys(StreamableMod));
-  console.error("   Verfügbare Exporte sse.js:", Object.keys(SseMod));
-  process.exit(1);
+  throw new Error("Kein HTTP/SSE-Transport im SDK gefunden.");
 }
 
 const { ctor: HttpLikeTransport, kind: transportKind } = pickHttpTransport();
 
-// --- Reddit OAuth (Script App) --------------------------------------------
+// ---------- Reddit OAuth ----------
 const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID;
 const REDDIT_SECRET    = process.env.REDDIT_SECRET;
 const REDDIT_USER      = process.env.REDDIT_USER;
 const REDDIT_PASS      = process.env.REDDIT_PASS;
+const API_KEY          = process.env.API_KEY || ""; // optionaler Schutz für Gateway
 
-function assertEnv(name, value) {
-  if (!value) {
-    console.error(`❌ Umgebungsvariable ${name} fehlt. Bitte in .env setzen.`);
-    process.exit(1);
-  }
+for (const [k, v] of Object.entries({
+  REDDIT_CLIENT_ID, REDDIT_SECRET, REDDIT_USER, REDDIT_PASS
+})) {
+  if (!v) { console.error(`❌ .env fehlt: ${k}`); process.exit(1); }
 }
-assertEnv("REDDIT_CLIENT_ID", REDDIT_CLIENT_ID);
-assertEnv("REDDIT_SECRET", REDDIT_SECRET);
-assertEnv("REDDIT_USER", REDDIT_USER);
-assertEnv("REDDIT_PASS", REDDIT_PASS);
 
 async function getRedditToken() {
   const auth = Buffer.from(`${REDDIT_CLIENT_ID}:${REDDIT_SECRET}`).toString("base64");
@@ -74,7 +59,6 @@ async function getRedditToken() {
     username: REDDIT_USER,
     password: REDDIT_PASS,
   });
-
   const res = await fetch("https://www.reddit.com/api/v1/access_token", {
     method: "POST",
     headers: {
@@ -84,11 +68,7 @@ async function getRedditToken() {
     },
     body
   });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Reddit Token fehlgeschlagen: ${res.status} ${text}`);
-  }
+  if (!res.ok) throw new Error(`Reddit Token fehlgeschlagen: ${res.status} ${await res.text().catch(()=> "")}`);
   const json = await res.json();
   if (!json.access_token) throw new Error("Kein access_token in Reddit-Antwort.");
   return json.access_token;
@@ -102,14 +82,11 @@ async function redditGet(path) {
       "User-Agent": "zive-reddit-mcp/1.0"
     }
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Reddit API Fehler: ${res.status} ${text}`);
-  }
+  if (!res.ok) throw new Error(`Reddit API Fehler: ${res.status} ${await res.text().catch(()=> "")}`);
   return res.json();
 }
 
-// --- MCP-Server + Tools ----------------------------------------------------
+// ---------- MCP-Server + Tools ----------
 const server = new Server(
   { name: "zive-reddit-mcp", version: "0.1.0" },
   {
@@ -169,15 +146,56 @@ const server = new Server(
   }
 );
 
-// --- HTTP/SSE Transport starten -------------------------------------------
-const port = Number(process.env.PORT || 8787);
-const transport = new HttpLikeTransport({ port }); // KEIN path und KEIN start() mehr
+// ---------- Upstream MCP starten ----------
+const upstreamPort = 8787; // interner Port
+const upstream = new HttpLikeTransport({ port: upstreamPort });
+await server.connect(upstream);
+// einige SDKs starten intern selbst; falls vorhanden, start() nur versuchen:
+if (typeof upstream.start === "function") {
+  try { await upstream.start(); } catch { /* already started */ }
+}
+console.log(`✅ MCP Upstream läuft auf :${upstreamPort} (Transport: ${transportKind})`);
 
-// Viele SDKs starten den Transport bereits in connect()
-await server.connect(transport);
+// ---------- Öffentliches Gateway (Render) ----------
+const publicPort = Number(process.env.PORT || 10000);
+const gateway = http.createServer((req, res) => {
+  // Health-Check für Render
+  if (req.url === "/healthz" && req.method === "GET") {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok");
+    return;
+  }
 
-console.log(`✅ MCP Server läuft auf Port ${port} (Transport: ${transportKind})`);
-console.log(`ℹ️  Hinweis: Der MCP-Endpunkt antwortet nur auf MCP/SSE-Anfragen, ein normaler Browser-GET kann 404/leer sein.`);
+  // Optionaler Token-Schutz
+  if (API_KEY) {
+    const key = req.headers["x-api-key"];
+    if (key !== API_KEY) {
+      res.writeHead(401, { "content-type": "text/plain" });
+      res.end("Unauthorized");
+      return;
+    }
+  }
 
-// Prozess offen halten
-await new Promise(() => {}); // läuft weiter
+  // Proxy zu Upstream (SSE-fähig, Header durchreichen)
+  const opts = {
+    hostname: "127.0.0.1",
+    port: upstreamPort,
+    method: req.method,
+    path: req.url,
+    headers: req.headers,
+  };
+  const p = http.request(opts, (pr) => {
+    res.writeHead(pr.statusCode || 502, pr.headers);
+    pr.pipe(res);
+  });
+  p.on("error", (e) => {
+    res.writeHead(502, { "content-type": "text/plain" });
+    res.end("Bad gateway: " + e.message);
+  });
+  req.pipe(p);
+});
+
+await new Promise((resolve) => gateway.listen(publicPort, resolve));
+console.log(`✅ Gateway läuft auf :${publicPort}`);
+console.log(`   Health:  GET /healthz  -> 200 OK`);
+console.log(`   MCP:     alle anderen Pfade werden 1:1 an den Upstream weitergeleitet`);

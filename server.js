@@ -159,8 +159,47 @@ console.log(`✅ MCP Upstream läuft auf :${upstreamPort} (Transport: ${transpor
 // ---------- Öffentliches Gateway (Render) ----------
 const publicPort = Number(process.env.PORT || 10000);
 
-// Upstream ganz sicher starten lassen
-await new Promise(r => setTimeout(r, 1200));
+// Upstream sicher „warm“ werden lassen
+await new Promise(r => setTimeout(r, 1500));
+
+import http from "node:http";
+
+// Helper: Proxy-Request mit Host-Fallback (IPv4/IPv6)
+function proxyToUpstream(req, res, upstreamPath) {
+  const hosts = ["127.0.0.1", "localhost", "::1"]; // der Reihe nach probieren
+  let tried = 0;
+
+  const tryOnce = () => {
+    const host = hosts[tried];
+    const opts = {
+      hostname: host,
+      port: upstreamPort,
+      method: req.method,
+      path: upstreamPath,
+      headers: req.headers,
+    };
+
+    const p = http.request(opts, (pr) => {
+      res.writeHead(pr.statusCode || 502, pr.headers);
+      pr.pipe(res);
+    });
+
+    p.on("error", (e) => {
+      tried += 1;
+      if (tried < hosts.length) {
+        // Nächsten Host versuchen
+        tryOnce();
+      } else {
+        res.writeHead(502, { "content-type": "text/plain" });
+        res.end("Bad gateway: " + e.message);
+      }
+    });
+
+    req.pipe(p);
+  };
+
+  tryOnce();
+}
 
 const gateway = http.createServer((req, res) => {
   // Health-Check
@@ -180,38 +219,26 @@ const gateway = http.createServer((req, res) => {
     }
   }
 
-  // Wir akzeptieren sowohl /mcp* als auch /
-  const isMcp = req.url.startsWith("/mcp");
-  const targetPath = isMcp
-    ? (req.url.replace(/^\/mcp/, "") || "/")  // /mcp -> /
-    : (req.url === "/" ? "/" : null);         // nur Root ohne /mcp
+  // Zielpfad auf dem Upstream:
+  // - /mcp*  -> /mcp*
+  // - /      -> /mcp
+  let upstreamPath = null;
+  if (req.url === "/") {
+    upstreamPath = "/mcp";
+  } else if (req.url.startsWith("/mcp")) {
+    upstreamPath = req.url; // unverändert
+  }
 
-  if (!targetPath) {
+  if (!upstreamPath) {
     res.writeHead(404, { "content-type": "text/plain" });
     res.end("Not found");
     return;
   }
 
-  const opts = {
-    hostname: "127.0.0.1",
-    port: upstreamPort,
-    method: req.method,
-    path: targetPath,
-    headers: req.headers,
-  };
-
-  const p = http.request(opts, pr => {
-    res.writeHead(pr.statusCode || 502, pr.headers);
-    pr.pipe(res);
-  });
-  p.on("error", e => {
-    res.writeHead(502, { "content-type": "text/plain" });
-    res.end("Bad gateway: " + e.message);
-  });
-  req.pipe(p);
+  proxyToUpstream(req, res, upstreamPath);
 });
 
-await new Promise(resolve => gateway.listen(publicPort, resolve));
+await new Promise((resolve) => gateway.listen(publicPort, resolve));
 console.log(`✅ Gateway läuft auf :${publicPort}`);
 console.log(`   Health:  GET /healthz -> 200 OK`);
-console.log(`   Proxy:   /  und /mcp*  -> Upstream :${upstreamPort}`);
+console.log(`   Proxy:   /  und /mcp*  -> Upstream :${upstreamPort} (/mcp)`);

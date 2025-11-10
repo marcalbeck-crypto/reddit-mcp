@@ -120,49 +120,68 @@ const server = new Server(
   }
 );
 
-// ---- EIN gemeinsamer öffentlicher HTTP-Server (Render-Port) ----
+// ---------- Öffentliches Gateway (Render) ----------
 const publicPort = Number(process.env.PORT || 10000);
-const app = http.createServer((req, res) => {
-  // Health-Check für Render
+
+// 3s warten, damit der Upstream sicher ready ist
+await new Promise(r => setTimeout(r, 3000));
+
+const gateway = http.createServer((req, res) => {
+  // Health-Check
   if (req.url === "/healthz" && req.method === "GET") {
-    res.writeHead(200, { "content-type":"text/plain" });
+    res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
     return;
   }
+
+  // Info-Seite für Root
+  if (req.url === "/" && req.method === "GET") {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("Reddit MCP up. Use /mcp.");
+    return;
+  }
+
+  // Nur /mcp (und Unterpfade) sind erlaubt
+  if (!req.url.startsWith("/mcp")) {
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("Not found");
+    return;
+  }
+
   // Optionaler API-Key
   if (API_KEY) {
     const key = req.headers["x-api-key"];
     if (key !== API_KEY) {
-      res.writeHead(401, { "content-type":"text/plain" });
+      res.writeHead(401, { "content-type": "text/plain" });
       res.end("Unauthorized");
       return;
     }
   }
-  // Alles Weitere überlässt dieser Server dem MCP-Transport (SSE unter /mcp)
-  // Der Transport hängt sich mit path:'/mcp' an DIESEN Server.
-  res.writeHead(404, { "content-type":"text/plain" });
-  res.end("Not found");
+
+  // *** HART auf IPv4 und richtiger Pfad /mcp proxen ***
+  const opts = {
+    hostname: "127.0.0.1",           // KEIN ::1, KEIN localhost
+    port: upstreamPort,              // 8787
+    method: req.method,
+    path: req.url,                   // /mcp...
+    headers: req.headers,
+  };
+
+  const p = http.request(opts, (pr) => {
+    res.writeHead(pr.statusCode || 502, pr.headers);
+    pr.pipe(res);
+  });
+
+  p.on("error", (e) => {
+    res.writeHead(502, { "content-type": "text/plain" });
+    res.end("Bad gateway: " + e.message);
+  });
+
+  req.pipe(p);
 });
 
-// MCP-Transport direkt an den öffentlichen Server hängen
-// Viele SDK-Builds akzeptieren { server, path }; falls nicht, nutzen wir den Port direkt.
-let transport;
-try {
-  transport = new HttpTransport({ server: app, path: "/mcp" });
-} catch {
-  // Fallback: direkt auf dem Port lauschen (dann bitte in Render Health-Check /healthz lassen)
-  transport = new HttpTransport({ port: publicPort, path: "/mcp" });
-}
-
-// Server starten (falls wir ihn selbst verwalten)
-await new Promise(resolve => app.listen(publicPort, resolve)).catch(()=>{ /* wenn Transport schon Port bindet */ });
-
-// MCP verbinden
-await server.connect(transport);
-// einige SDKs brauchen ein explizites start()
-if (typeof transport.start === "function") {
-  try { await transport.start(); } catch { /* already started */ }
-}
-
-console.log(`✅ MCP läuft (Transport: ${transportKind}) auf :${publicPort} unter Pfad /mcp`);
+await new Promise((resolve) => gateway.listen(publicPort, resolve));
+console.log(`✅ Gateway läuft auf :${publicPort}`);
 console.log(`   Health:  GET /healthz -> 200 OK`);
+console.log(`   Info:    GET /        -> 'Reddit MCP up. Use /mcp.'`);
+console.log(`   Proxy:   /mcp*  -> 127.0.0.1:${upstreamPort}/mcp`);

@@ -1,12 +1,13 @@
-// server.js — Reddit MCP + Render-Gateway mit /healthz und optional x-api-key
+// server.js — Reddit MCP + Render Gateway (clean)
 
-// ---------- MCP SDK ----------
+// ---------- Imports ----------
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import * as StreamableMod from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as SseMod from "@modelcontextprotocol/sdk/server/sse.js";
 import http from "node:http";
+import net from "node:net";
 
-// Transport dynamisch finden (verschiedene SDK-Exporte möglich)
+// ---------- Transport finden (verschiedene SDK-Exporte möglich) ----------
 function pickHttpTransport() {
   const candidates = [
     ["streamableHttp", StreamableMod, [
@@ -26,8 +27,8 @@ function pickHttpTransport() {
   for (const [kind, mod, names] of candidates) {
     if (!mod) continue;
     for (const n of names) {
-      const ctor = mod?.[n];
-      if (typeof ctor === "function") return { ctor, kind };
+      const v = mod?.[n];
+      if (typeof v === "function") return { ctor: v, kind };
     }
     for (const k of Object.keys(mod)) {
       const v = mod[k];
@@ -36,7 +37,6 @@ function pickHttpTransport() {
   }
   throw new Error("Kein HTTP/SSE-Transport im SDK gefunden.");
 }
-
 const { ctor: HttpLikeTransport, kind: transportKind } = pickHttpTransport();
 
 // ---------- Reddit OAuth ----------
@@ -44,7 +44,7 @@ const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID;
 const REDDIT_SECRET    = process.env.REDDIT_SECRET;
 const REDDIT_USER      = process.env.REDDIT_USER;
 const REDDIT_PASS      = process.env.REDDIT_PASS;
-const API_KEY          = process.env.API_KEY || ""; // optionaler Schutz für Gateway
+const API_KEY          = process.env.API_KEY || ""; // optional
 
 for (const [k, v] of Object.entries({
   REDDIT_CLIENT_ID, REDDIT_SECRET, REDDIT_USER, REDDIT_PASS
@@ -77,10 +77,7 @@ async function getRedditToken() {
 async function redditGet(path) {
   const token = await getRedditToken();
   const res = await fetch(`https://oauth.reddit.com${path}`, {
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "User-Agent": "zive-reddit-mcp/1.0"
-    }
+    headers: { "Authorization": `Bearer ${token}`, "User-Agent": "zive-reddit-mcp/1.0" }
   });
   if (!res.ok) throw new Error(`Reddit API Fehler: ${res.status} ${await res.text().catch(()=> "")}`);
   return res.json();
@@ -147,60 +144,32 @@ const server = new Server(
 );
 
 // ---------- Upstream MCP starten ----------
-const upstreamPort = 8787; // interner Port
+const upstreamPort = 8787;
 const upstream = new HttpLikeTransport({ port: upstreamPort });
 await server.connect(upstream);
-// einige SDKs starten intern selbst; falls vorhanden, start() nur versuchen:
+// einige SDKs starten intern selbst; start() nur falls vorhanden/noch nicht gestartet
 if (typeof upstream.start === "function") {
   try { await upstream.start(); } catch { /* already started */ }
 }
 console.log(`✅ MCP Upstream läuft auf :${upstreamPort} (Transport: ${transportKind})`);
 
+// Warte aktiv, bis Upstream TCP annimmt (max. ~5s)
+await new Promise((resolve) => {
+  let tries = 0;
+  const tick = () => {
+    const sock = net.connect({ host: "127.0.0.1", port: upstreamPort }, () => {
+      sock.destroy(); resolve();
+    });
+    sock.on("error", () => {
+      tries += 1;
+      if (tries > 10) resolve(); else setTimeout(tick, 300);
+    });
+  };
+  tick();
+});
+
 // ---------- Öffentliches Gateway (Render) ----------
 const publicPort = Number(process.env.PORT || 10000);
-
-// Upstream sicher „warm“ werden lassen
-await new Promise(r => setTimeout(r, 1500));
-
-import http from "node:http";
-
-// Helper: Proxy-Request mit Host-Fallback (IPv4/IPv6)
-function proxyToUpstream(req, res, upstreamPath) {
-  const hosts = ["127.0.0.1", "localhost", "::1"]; // der Reihe nach probieren
-  let tried = 0;
-
-  const tryOnce = () => {
-    const host = hosts[tried];
-    const opts = {
-      hostname: host,
-      port: upstreamPort,
-      method: req.method,
-      path: upstreamPath,
-      headers: req.headers,
-    };
-
-    const p = http.request(opts, (pr) => {
-      res.writeHead(pr.statusCode || 502, pr.headers);
-      pr.pipe(res);
-    });
-
-    p.on("error", (e) => {
-      tried += 1;
-      if (tried < hosts.length) {
-        // Nächsten Host versuchen
-        tryOnce();
-      } else {
-        res.writeHead(502, { "content-type": "text/plain" });
-        res.end("Bad gateway: " + e.message);
-      }
-    });
-
-    req.pipe(p);
-  };
-
-  tryOnce();
-}
-
 const gateway = http.createServer((req, res) => {
   // Health-Check
   if (req.url === "/healthz" && req.method === "GET") {
@@ -219,15 +188,12 @@ const gateway = http.createServer((req, res) => {
     }
   }
 
-  // Zielpfad auf dem Upstream:
+  // Zielpfad auf Upstream:
   // - /mcp*  -> /mcp*
   // - /      -> /mcp
   let upstreamPath = null;
-  if (req.url === "/") {
-    upstreamPath = "/mcp";
-  } else if (req.url.startsWith("/mcp")) {
-    upstreamPath = req.url; // unverändert
-  }
+  if (req.url === "/") upstreamPath = "/mcp";
+  else if (req.url.startsWith("/mcp")) upstreamPath = req.url;
 
   if (!upstreamPath) {
     res.writeHead(404, { "content-type": "text/plain" });
@@ -235,7 +201,33 @@ const gateway = http.createServer((req, res) => {
     return;
   }
 
-  proxyToUpstream(req, res, upstreamPath);
+  // Proxy mit Host-Fallback (IPv4/IPv6)
+  const hosts = ["127.0.0.1", "localhost", "::1"];
+  let i = 0;
+  const tryHost = () => {
+    const host = hosts[i];
+    const opts = {
+      hostname: host,
+      port: upstreamPort,
+      method: req.method,
+      path: upstreamPath,
+      headers: req.headers,
+    };
+    const p = http.request(opts, (pr) => {
+      res.writeHead(pr.statusCode || 502, pr.headers);
+      pr.pipe(res);
+    });
+    p.on("error", (e) => {
+      i += 1;
+      if (i < hosts.length) tryHost();
+      else {
+        res.writeHead(502, { "content-type": "text/plain" });
+        res.end("Bad gateway: " + e.message);
+      }
+    });
+    req.pipe(p);
+  };
+  tryHost();
 });
 
 await new Promise((resolve) => gateway.listen(publicPort, resolve));

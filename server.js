@@ -159,8 +159,8 @@ console.log(`✅ MCP Upstream läuft auf :${upstreamPort} (Transport: ${transpor
 // ---------- Öffentliches Gateway (Render) ----------
 const publicPort = Number(process.env.PORT || 10000);
 
-// Mini-Wartezeit, damit der Upstream sicher lauscht
-await new Promise(r => setTimeout(r, 800));
+// Upstream ganz sicher starten lassen
+await new Promise(r => setTimeout(r, 1200));
 
 const gateway = http.createServer((req, res) => {
   // Health-Check
@@ -170,21 +170,7 @@ const gateway = http.createServer((req, res) => {
     return;
   }
 
-  // Root: kleine Info statt Proxy (verhindert Bad Gateway im Browser)
-  if (req.url === "/" && req.method === "GET") {
-    res.writeHead(200, { "content-type": "text/plain" });
-    res.end("Reddit MCP up. Use /mcp.");
-    return;
-  }
-
-  // Nur /mcp (und Unterpfade) werden an den Upstream geleitet
-  if (!req.url.startsWith("/mcp")) {
-    res.writeHead(404, { "content-type": "text/plain" });
-    res.end("Not found");
-    return;
-  }
-
-  // Optionaler Token-Schutz
+  // Optionaler API-Key
   if (API_KEY) {
     const key = req.headers["x-api-key"];
     if (key !== API_KEY) {
@@ -194,30 +180,38 @@ const gateway = http.createServer((req, res) => {
     }
   }
 
-  // Proxy zu Upstream (SSE-fähig)
+  // Wir akzeptieren sowohl /mcp* als auch /
+  const isMcp = req.url.startsWith("/mcp");
+  const targetPath = isMcp
+    ? (req.url.replace(/^\/mcp/, "") || "/")  // /mcp -> /
+    : (req.url === "/" ? "/" : null);         // nur Root ohne /mcp
+
+  if (!targetPath) {
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("Not found");
+    return;
+  }
+
   const opts = {
-    hostname: "localhost",            // robuster als 127.0.0.1 bei manchen Bindings
+    hostname: "127.0.0.1",
     port: upstreamPort,
     method: req.method,
-    path: req.url,                    // erwartet /mcp…
+    path: targetPath,
     headers: req.headers,
   };
 
-  const p = http.request(opts, (pr) => {
+  const p = http.request(opts, pr => {
     res.writeHead(pr.statusCode || 502, pr.headers);
     pr.pipe(res);
   });
-
-  p.on("error", (e) => {
+  p.on("error", e => {
     res.writeHead(502, { "content-type": "text/plain" });
     res.end("Bad gateway: " + e.message);
   });
-
   req.pipe(p);
 });
 
-await new Promise((resolve) => gateway.listen(publicPort, resolve));
+await new Promise(resolve => gateway.listen(publicPort, resolve));
 console.log(`✅ Gateway läuft auf :${publicPort}`);
 console.log(`   Health:  GET /healthz -> 200 OK`);
-console.log(`   Info:    GET /        -> 'Reddit MCP up. Use /mcp.'`);
-console.log(`   Proxy:   /mcp*  -> Upstream :${upstreamPort}`);
+console.log(`   Proxy:   /  und /mcp*  -> Upstream :${upstreamPort}`);

@@ -1,7 +1,11 @@
 // server.js - Reddit MCP Server für Render (Node 22+)
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { 
+  ListToolsRequestSchema, 
+  CallToolRequestSchema,
+  InitializeRequestSchema 
+} from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 
 // ========== KONFIGURATION ==========
@@ -119,6 +123,7 @@ app.get("/", (req, res) => {
     service: "ZIVE Reddit MCP Server",
     status: "running",
     version: "1.0.0",
+    protocol: "MCP 2024-11-05",
     endpoints: {
       mcp: "/mcp",
       health: "/healthz"
@@ -130,186 +135,209 @@ app.get("/", (req, res) => {
   });
 });
 
-// ========== MCP SERVER (SINGLETON) ==========
-const mcpServer = new Server(
-  {
-    name: "zive-reddit-mcp",
-    version: "1.0.0"
-  },
-  {
-    capabilities: {
-      tools: {}
-    }
-  }
-);
-
-// Handler für Tool-Liste
-mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-  console.log("📋 Tools/list angefordert");
-  return {
-    tools: [
-      {
-        name: "reddit_top_posts",
-        description: "Hole die Top-Posts aus einem Subreddit für Sentiment-Analyse und Social Buzz",
-        inputSchema: {
-          type: "object",
-          properties: {
-            subreddit: {
-              type: "string",
-              description: "Subreddit-Name ohne 'r/' (z.B. 'stocks', 'wallstreetbets', 'investing')"
-            },
-            time: {
-              type: "string",
-              enum: ["hour", "day", "week", "month", "year", "all"],
-              default: "day",
-              description: "Zeitraum für Top-Posts"
-            },
-            limit: {
-              type: "number",
-              default: 10,
-              minimum: 1,
-              maximum: 100,
-              description: "Anzahl der Posts (1-100)"
-            }
-          },
-          required: ["subreddit"]
-        }
-      },
-      {
-        name: "reddit_search",
-        description: "Suche Posts auf Reddit (z.B. nach Ticker-Symbolen, Unternehmen). Perfekt für Aktien-Buzz.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Suchbegriff (z.B. Ticker wie 'AAPL', 'TSLA' oder Unternehmen)"
-            },
-            subreddit: {
-              type: "string",
-              description: "Optional: Suche auf ein Subreddit beschränken"
-            },
-            limit: {
-              type: "number",
-              default: 10,
-              minimum: 1,
-              maximum: 100,
-              description: "Anzahl der Ergebnisse"
-            },
-            sort: {
-              type: "string",
-              enum: ["relevance", "hot", "top", "new"],
-              default: "relevance",
-              description: "Sortierung der Ergebnisse"
-            }
-          },
-          required: ["query"]
-        }
+// ========== MCP SERVER FACTORY ==========
+function createMCPServer() {
+  const server = new Server(
+    {
+      name: "zive-reddit-mcp",
+      version: "1.0.0"
+    },
+    {
+      capabilities: {
+        tools: {}
       }
-    ]
-  };
-});
-
-// Handler für Tool-Ausführung
-mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  console.log(`🔧 Tool aufgerufen: ${name}`, args);
-
-  try {
-    if (name === "reddit_top_posts") {
-      const { subreddit, time = "day", limit = 10 } = args;
-      const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 100);
-      
-      console.log(`📊 Hole Top-Posts: r/${subreddit} (${time}, limit=${safeLimit})`);
-      
-      const data = await redditGet(`/r/${subreddit}/top.json?t=${time}&limit=${safeLimit}`);
-      const posts = (data?.data?.children || []).map(c => ({
-        title: c?.data?.title,
-        url: c?.data?.permalink ? `https://www.reddit.com${c.data.permalink}` : null,
-        score: c?.data?.score,
-        upvote_ratio: c?.data?.upvote_ratio,
-        author: c?.data?.author,
-        num_comments: c?.data?.num_comments,
-        created_utc: c?.data?.created_utc,
-        selftext: c?.data?.selftext?.substring(0, 500)
-      }));
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ subreddit, time, count: posts.length, posts }, null, 2)
-          }
-        ]
-      };
     }
+  );
 
-    if (name === "reddit_search") {
-      const { query, subreddit, limit = 10, sort = "relevance" } = args;
-      const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 100);
-      const q = encodeURIComponent(query);
-      
-      const path = subreddit
-        ? `/r/${subreddit}/search.json?q=${q}&restrict_sr=on&limit=${safeLimit}&sort=${sort}`
-        : `/search.json?q=${q}&limit=${safeLimit}&sort=${sort}`;
-      
-      console.log(`🔍 Suche: "${query}"${subreddit ? ` in r/${subreddit}` : ""}`);
-      
-      const data = await redditGet(path);
-      const results = (data?.data?.children || []).map(c => ({
-        title: c?.data?.title,
-        url: c?.data?.permalink ? `https://www.reddit.com${c.data.permalink}` : null,
-        score: c?.data?.score,
-        subreddit: c?.data?.subreddit,
-        upvote_ratio: c?.data?.upvote_ratio,
-        num_comments: c?.data?.num_comments,
-        created_utc: c?.data?.created_utc,
-        selftext: c?.data?.selftext?.substring(0, 300)
-      }));
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ query, count: results.length, results }, null, 2)
-          }
-        ]
-      };
-    }
-
-    throw new Error(`Unbekanntes Tool: ${name}`);
-  } catch (error) {
-    console.error(`❌ Tool ${name} fehlgeschlagen:`, error);
+  // Initialize Handler
+  server.setRequestHandler(InitializeRequestSchema, async (request) => {
+    console.log("🔧 Initialize Request:", request.params);
     return {
-      content: [
-        {
-          type: "text",
-          text: `Fehler: ${error.message}`
-        }
-      ],
-      isError: true
+      protocolVersion: "2024-11-05",
+      capabilities: {
+        tools: {}
+      },
+      serverInfo: {
+        name: "zive-reddit-mcp",
+        version: "1.0.0"
+      }
     };
-  }
-});
+  });
 
-// ========== SSE ENDPOINT (GET + POST) ==========
+  // Handler für Tool-Liste
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    console.log("📋 Tools/list angefordert");
+    return {
+      tools: [
+        {
+          name: "reddit_top_posts",
+          description: "Hole die Top-Posts aus einem Subreddit für Sentiment-Analyse und Social Buzz",
+          inputSchema: {
+            type: "object",
+            properties: {
+              subreddit: {
+                type: "string",
+                description: "Subreddit-Name ohne 'r/' (z.B. 'stocks', 'wallstreetbets', 'investing')"
+              },
+              time: {
+                type: "string",
+                enum: ["hour", "day", "week", "month", "year", "all"],
+                default: "day",
+                description: "Zeitraum für Top-Posts"
+              },
+              limit: {
+                type: "number",
+                default: 10,
+                minimum: 1,
+                maximum: 100,
+                description: "Anzahl der Posts (1-100)"
+              }
+            },
+            required: ["subreddit"]
+          }
+        },
+        {
+          name: "reddit_search",
+          description: "Suche Posts auf Reddit (z.B. nach Ticker-Symbolen, Unternehmen). Perfekt für Aktien-Buzz.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description: "Suchbegriff (z.B. Ticker wie 'AAPL', 'TSLA' oder Unternehmen)"
+              },
+              subreddit: {
+                type: "string",
+                description: "Optional: Suche auf ein Subreddit beschränken"
+              },
+              limit: {
+                type: "number",
+                default: 10,
+                minimum: 1,
+                maximum: 100,
+                description: "Anzahl der Ergebnisse"
+              },
+              sort: {
+                type: "string",
+                enum: ["relevance", "hot", "top", "new"],
+                default: "relevance",
+                description: "Sortierung der Ergebnisse"
+              }
+            },
+            required: ["query"]
+          }
+        }
+      ]
+    };
+  });
+
+  // Handler für Tool-Ausführung
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    console.log(`🔧 Tool aufgerufen: ${name}`, args);
+
+    try {
+      if (name === "reddit_top_posts") {
+        const { subreddit, time = "day", limit = 10 } = args;
+        const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 100);
+        
+        console.log(`📊 Hole Top-Posts: r/${subreddit} (${time}, limit=${safeLimit})`);
+        
+        const data = await redditGet(`/r/${subreddit}/top.json?t=${time}&limit=${safeLimit}`);
+        const posts = (data?.data?.children || []).map(c => ({
+          title: c?.data?.title,
+          url: c?.data?.permalink ? `https://www.reddit.com${c.data.permalink}` : null,
+          score: c?.data?.score,
+          upvote_ratio: c?.data?.upvote_ratio,
+          author: c?.data?.author,
+          num_comments: c?.data?.num_comments,
+          created_utc: c?.data?.created_utc,
+          selftext: c?.data?.selftext?.substring(0, 500)
+        }));
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ subreddit, time, count: posts.length, posts }, null, 2)
+            }
+          ]
+        };
+      }
+
+      if (name === "reddit_search") {
+        const { query, subreddit, limit = 10, sort = "relevance" } = args;
+        const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 100);
+        const q = encodeURIComponent(query);
+        
+        const path = subreddit
+          ? `/r/${subreddit}/search.json?q=${q}&restrict_sr=on&limit=${safeLimit}&sort=${sort}`
+          : `/search.json?q=${q}&limit=${safeLimit}&sort=${sort}`;
+        
+        console.log(`🔍 Suche: "${query}"${subreddit ? ` in r/${subreddit}` : ""}`);
+        
+        const data = await redditGet(path);
+        const results = (data?.data?.children || []).map(c => ({
+          title: c?.data?.title,
+          url: c?.data?.permalink ? `https://www.reddit.com${c.data.permalink}` : null,
+          score: c?.data?.score,
+          subreddit: c?.data?.subreddit,
+          upvote_ratio: c?.data?.upvote_ratio,
+          num_comments: c?.data?.num_comments,
+          created_utc: c?.data?.created_utc,
+          selftext: c?.data?.selftext?.substring(0, 300)
+        }));
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ query, count: results.length, results }, null, 2)
+            }
+          ]
+        };
+      }
+
+      throw new Error(`Unbekanntes Tool: ${name}`);
+    } catch (error) {
+      console.error(`❌ Tool ${name} fehlgeschlagen:`, error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Fehler: ${error.message}`
+          }
+        ],
+        isError: true
+      };
+    }
+  });
+
+  return server;
+}
+
+// ========== SSE ENDPOINT ==========
 const handleMCPConnection = async (req, res) => {
   console.log(`🔌 MCP ${req.method} Request empfangen`);
+  console.log(`   Headers:`, JSON.stringify(req.headers, null, 2));
   
-  // API-Key Check (nur wenn gesetzt)
+  // API-Key Check
   if (API_KEY) {
     const providedKey = req.headers["x-api-key"] || req.query.apiKey;
     if (providedKey !== API_KEY) {
       console.log("❌ Ungültiger API Key");
-      res.status(401).send("Unauthorized: Invalid API Key");
+      res.status(401).send("Unauthorized");
       return;
     }
   }
 
   try {
+    // Neuen Server für diese Verbindung
+    const mcpServer = createMCPServer();
+    
     const transport = new SSEServerTransport("/mcp", res);
     await mcpServer.connect(transport);
-    console.log("✅ MCP Transport verbunden");
+    console.log("✅ MCP Transport verbunden - warte auf Requests...");
   } catch (error) {
     console.error("❌ MCP Connection Error:", error);
     if (!res.headersSent) {
@@ -318,7 +346,6 @@ const handleMCPConnection = async (req, res) => {
   }
 };
 
-// Beide Methoden unterstützen
 app.get("/mcp", handleMCPConnection);
 app.post("/mcp", handleMCPConnection);
 
@@ -330,7 +357,7 @@ app.listen(PORT, () => {
   console.log(`📡 Port:         ${PORT}`);
   console.log(`🔗 MCP Endpoint: http://localhost:${PORT}/mcp`);
   console.log(`💚 Health Check: http://localhost:${PORT}/healthz`);
-  console.log(`🔑 API Key:      ${API_KEY ? "aktiviert" : "DEAKTIVIERT (empfohlen für Tests)"}`);
+  console.log(`🔑 API Key:      ${API_KEY ? "aktiviert" : "DEAKTIVIERT"}`);
   console.log("=".repeat(60) + "\n");
 });
 

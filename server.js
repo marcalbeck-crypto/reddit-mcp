@@ -266,7 +266,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // ========== HTTP SERVER ==========
-const httpServer = http.createServer((req, res) => {
+const httpServer = http.createServer(async (req, res) => {
   // Health Check für Render
   if (req.url === "/healthz" || req.url === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -289,29 +289,29 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // API-Key Check (optional)
-  if (API_KEY && req.url?.startsWith("/mcp")) {
-    const providedKey = req.headers["x-api-key"];
-    if (providedKey !== API_KEY) {
-      res.writeHead(401, { "Content-Type": "text/plain" });
-      res.end("Unauthorized: Invalid API Key");
-      return;
+  // MCP Endpoint
+  if (req.url === "/mcp" && req.method === "POST") {
+    // API-Key Check (optional)
+    if (API_KEY) {
+      const providedKey = req.headers["x-api-key"];
+      if (providedKey !== API_KEY) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("Unauthorized: Invalid API Key");
+        return;
+      }
     }
+
+    // SSE Transport für diese spezifische Anfrage erstellen
+    const transport = new SSEServerTransport("/mcp", res);
+    await mcpServer.connect(transport);
+    console.log("✅ MCP Client verbunden");
+    return;
   }
 
   // Nicht behandelte Routen
-  if (!req.url?.startsWith("/mcp")) {
-    res.writeHead(404, { "Content-Type": "text/plain" });
-    res.end("Not Found");
-  }
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not Found");
 });
-
-// ========== MCP TRANSPORT ==========
-const transport = new SSEServerTransport("/mcp", httpServer);
-
-// Server verbinden
-await mcpServer.connect(transport);
-console.log("✅ MCP Transport verbunden");
 
 // ========== SERVER STARTEN ==========
 httpServer.listen(PORT, () => {

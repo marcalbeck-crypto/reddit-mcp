@@ -1,4 +1,4 @@
-// server.js - Reddit MCP Server für ZIVE
+// server.js - Reddit MCP Server für ZIVE (HTTP-basiert wie Alpha Vantage)
 import express from "express";
 
 // ========== KONFIGURATION ==========
@@ -161,7 +161,7 @@ const TOOLS = [
 
 // ========== MCP HANDLERS ==========
 async function handleInitialize(params) {
-  console.log("🔧 Initialize Request:", params);
+  console.log("🔧 Initialize Request");
   return {
     protocolVersion: "2024-11-05",
     capabilities: {
@@ -181,7 +181,7 @@ async function handleListTools() {
 
 async function handleCallTool(params) {
   const { name, arguments: args } = params;
-  console.log(`🔧 Tool aufgerufen: ${name}`, args);
+  console.log(`🔧 Tool aufgerufen: ${name}`);
 
   try {
     if (name === "reddit_top_posts") {
@@ -268,30 +268,37 @@ app.use(express.json());
 app.get("/healthz", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
-// Root-Info
+// Root Endpoint - MCP Server Info (wie Alpha Vantage)
 app.get("/", (req, res) => {
   res.json({
     service: "ZIVE Reddit MCP Server",
     status: "running",
     version: "1.0.0",
     protocol: "MCP 2024-11-05",
-    tools: TOOLS.map(t => t.name)
+    endpoint: "/mcp",
+    tools: TOOLS.map(t => ({ name: t.name, description: t.description }))
   });
 });
 
-// MCP Endpoint - JSON-RPC über HTTP
+// MCP Endpoint - JSON-RPC über HTTP (wie Alpha Vantage)
 app.post("/mcp", async (req, res) => {
-  console.log("🔌 MCP POST Request:", JSON.stringify(req.body, null, 2));
+  const { jsonrpc, id, method, params } = req.body;
   
-  // API-Key Check
+  console.log(`🔌 MCP ${method}${id !== undefined ? ` (id: ${id})` : ""}`);
+  
+  // API-Key Check (Query-Parameter wie Alpha Vantage)
   if (API_KEY) {
-    const providedKey = req.headers["x-api-key"];
+    const providedKey = req.query.apikey || req.headers["x-api-key"];
     if (providedKey !== API_KEY) {
       return res.status(401).json({ error: "Unauthorized" });
     }
   }
 
-  const { jsonrpc, id, method, params } = req.body;
+  // Notifications haben keine ID und brauchen nur 200 OK
+  if (method?.startsWith("notifications/")) {
+    console.log(`📢 Notification: ${method}`);
+    return res.status(200).end();
+  }
 
   try {
     let result;
@@ -307,7 +314,8 @@ app.post("/mcp", async (req, res) => {
         result = await handleCallTool(params);
         break;
       default:
-        return res.status(400).json({
+        console.log(`⚠️  Unbekannte Methode: ${method}`);
+        return res.json({
           jsonrpc: "2.0",
           id,
           error: {
@@ -324,7 +332,7 @@ app.post("/mcp", async (req, res) => {
     });
   } catch (error) {
     console.error("❌ MCP Error:", error);
-    res.status(500).json({
+    res.json({
       jsonrpc: "2.0",
       id,
       error: {
@@ -341,10 +349,10 @@ app.listen(PORT, () => {
   console.log("🚀 ZIVE REDDIT MCP SERVER GESTARTET");
   console.log("=".repeat(60));
   console.log(`📡 Port:         ${PORT}`);
-  console.log(`🔗 MCP Endpoint: http://localhost:${PORT}/mcp`);
-  console.log(`💚 Health Check: http://localhost:${PORT}/healthz`);
-  console.log(`🔑 API Key:      ${API_KEY ? "aktiviert" : "DEAKTIVIERT"}`);
-  console.log(`🛠️  Tools:        ${TOOLS.length}`);
+  console.log(`🔗 MCP Endpoint: /mcp`);
+  console.log(`💚 Health Check: /healthz`);
+  console.log(`🔑 API Key:      ${API_KEY ? "aktiviert (?apikey=...)" : "DEAKTIVIERT"}`);
+  console.log(`🛠️  Tools:        ${TOOLS.length} (${TOOLS.map(t => t.name).join(", ")})`);
   console.log("=".repeat(60) + "\n");
 });
 

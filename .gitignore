@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Environment-Variablen (niemals hochladen!)
+.env
+.env.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS-spezifische Dateien
+.DS_Store
+Thumbs.db
+
+# IDE-spezifische Dateien
+.vscode/
+.idea/
